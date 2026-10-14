@@ -301,6 +301,7 @@ objc_library(
     srcs = ["gpu_backend_metal.mm"],
     hdrs = ["gpu_backend_metal.h"],
     deps = [
+        "@agello_telemetry//:metal",
         ":delegate_data",
         ":delegate_options",
         ":delegate_utils",

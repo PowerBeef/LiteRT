@@ -140,5 +140,8 @@ cc_library(
     name = "perfetto_profiling_stub",
     srcs = ["perfetto_profiling.cc"],
     hdrs = ["perfetto_profiling.h"],
+    # Agello: trace sites feed Agello telemetry.
+    defines = ["LITERT_AGELLO_TELEMETRY"],
     visibility = ["//visibility:private"],
+    deps = ["@agello_telemetry//:telemetry"],
 )

@@ -15,7 +15,17 @@
 #ifndef THIRD_PARTY_ODML_LITERT_CORE_UTIL_PERFETTO_PROFILING_H_
 #define THIRD_PARTY_ODML_LITERT_CORE_UTIL_PERFETTO_PROFILING_H_
 
+#if defined(LITERT_AGELLO_TELEMETRY)
+// Agello: LiteRT's trace sites become telemetry spans (aggregates and signposts at level 2+).
+#include "agello/agello_telemetry.h"  // from @agello_telemetry
+#define LITERT_PERFETTO_TRACE_EVENT(event_name)                                       \
+  static const int AGELLO_TELEMETRY_CONCAT(litert_span_id_, __LINE__) =              \
+      ::agello::telemetry::InternSpan(event_name);                                    \
+  ::agello::telemetry::ScopedSpan AGELLO_TELEMETRY_CONCAT(litert_span_, __LINE__)(    \
+      AGELLO_TELEMETRY_CONCAT(litert_span_id_, __LINE__))
+#else
 #define LITERT_PERFETTO_TRACE_EVENT(event_name)
+#endif
 #define LITERT_PERFETTO_TRACE_EVENT_INSTANT(event_name)
 #define LITERT_PERFETTO_TRACE_EVENT_ASYNC_START(event_name, event_id)
 #define LITERT_PERFETTO_TRACE_EVENT_ASYNC_END(event_id)

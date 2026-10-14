@@ -43,6 +43,8 @@
 #include "ml_drift_delegate/delegate/serialization_weight_cache/serialization_weight_cache.h"
 #include "ml_drift_delegate/delegate/shared_memory_manager/graph_adapter.h"
 #include "ml_drift_delegate/delegate/shared_memory_manager/shared_memory_manager_metal.h"
+#include "agello/agello_telemetry.h"  // from @agello_telemetry
+#import "agello/agello_telemetry_metal.h"  // from @agello_telemetry
 
 namespace litert::ml_drift {
 namespace {
@@ -199,6 +201,9 @@ absl::Status GpuBackendMetal::WaitForCompletion() {
     }];
   }
 
+  ::agello::telemetry::AttachGpuTiming(command_buffer_);
+  ::agello::telemetry::Count(::agello::telemetry::kGpuWaits);
+  ::agello::telemetry::ScopedSpan wait_span(::agello::telemetry::GpuWaitSpanForCurrentRun());
   [command_buffer_ commit];
 
   if (wait_type_ == kGpuDelegateWaitTypeActive) {
@@ -482,6 +487,7 @@ absl::Status GpuInferenceContextMetal::Dispatch() {
   if (backend_->wait_type() == kGpuDelegateWaitTypeActive) {
     // Commit the previous command buffer if any.
     if (backend_->command_buffer() != nullptr) {
+      ::agello::telemetry::AttachGpuTiming(backend_->command_buffer());
       [backend_->command_buffer() commit];
     }
 
