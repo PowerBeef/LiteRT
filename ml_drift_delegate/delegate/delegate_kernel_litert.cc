@@ -30,6 +30,7 @@
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/types/span.h"  // from @com_google_absl
+#include "agello/agello_telemetry.h"  // from @agello_telemetry
 #include "ml_drift/common/data_type.h"  // from @ml_drift
 #include "ml_drift/common/gpu_info.h"  // from @ml_drift
 #include "ml_drift/common/gpu_model.h"  // from @ml_drift
@@ -521,6 +522,18 @@ absl::Status DelegateKernelLiteRt::HandleOutputEvents(
 
     if (is_async_execution_mode) {
       LITERT_LOG(LITERT_DEBUG, "Backend doesn't support async execution mode");
+      // Agello telemetry: the run was asked to be asynchronous but the backend has no
+      // post-dispatch event (Metal), so outputs carry no event to wait on.
+      if (::agello::telemetry::Enabled(::agello::telemetry::kCounters)) {
+        static bool reported = [] {
+          ::agello::telemetry::SetFact("gpu_async", "unavailable: no post-dispatch event");
+          ::agello::telemetry::ReportAnomaly(
+              ::agello::telemetry::kAsyncUnavailable, ::agello::telemetry::kInfo, 0, 0,
+              "async run requested; the GPU backend has no post-dispatch event");
+          return true;
+        }();
+        (void)reported;
+      }
       return absl::OkStatus();
     }
 

@@ -530,6 +530,7 @@ cc_library(
     srcs = ["delegate_kernel.cc"],
     hdrs = ["delegate_kernel.h"],
     deps = [
+        "@agello_telemetry//:telemetry",
         ":delegate_data",
         ":delegate_options",
         ":delegate_utils",
@@ -617,6 +618,7 @@ cc_library(
     hdrs = ["delegate_kernel_litert.h"],
     copts = litert_metal_opts(),
     deps = [
+        "@agello_telemetry//:telemetry",
         ":delegate_kernel",
         ":delegate_options",
         ":gpu_backend",
@@ -998,6 +1000,7 @@ objc_library(
     # Required to prevent build errors when this target is reachable from the deps of Swift targets.
     aspect_hints = ["//tools/build_defs/swift:no_module"],
     deps = [
+        "@agello_telemetry//:telemetry",
         ":buffer_handler_metal_headers",
         ":buffer_handler_utils",
         "@com_google_absl//absl/cleanup",

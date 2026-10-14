@@ -22,12 +22,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <string>
 #include <utility>
 
 #include "absl/cleanup/cleanup.h"  // from @com_google_absl
 #include "absl/log/absl_log.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
+#include "agello/agello_telemetry.h"  // from @agello_telemetry
 #include "litert/c/litert_any.h"
 #include "litert/c/litert_common.h"
 #include "litert/c/litert_custom_tensor_buffer.h"
@@ -62,7 +64,25 @@ struct MetalMemoryInfo : public HwMemoryInfo {
   // to these strong members, ensuring they remain alive as long as this struct is alive.
   id<MTLDevice> metal_device;
   id<MTLCommandQueue> command_queue;
+  // Agello telemetry: per-size copy spans ("host.read <bytes> B"), interned on first use.
+  int read_span = -2;
+  int write_span = -2;
 };
+
+// Agello telemetry: the span for this buffer's copies in one direction, named by size so a report
+// can tell the tensors apart (logits, embeddings, masks...). -1 below level 2.
+int CopySpan(MetalMemoryInfo* memory_info, bool read) {
+  if (!::agello::telemetry::Enabled(::agello::telemetry::kSpans)) return -1;
+  int& span = read ? memory_info->read_span : memory_info->write_span;
+  if (span == -2) {
+    const bool packed = memory_info->buffer_type == kLiteRtTensorBufferTypeMetalBufferPacked;
+    const std::string name = std::string(read ? "host.read " : "host.write ") +
+                             std::to_string(memory_info->packed_bytes) + " B" +
+                             (packed ? "" : " (converted)");
+    span = ::agello::telemetry::InternSpan(name.c_str());
+  }
+  return span;
+}
 
 
 
@@ -313,6 +333,13 @@ LiteRtStatus LiteRtUnlockMetalMemory(HwMemoryInfoPtr hw_memory_info) {
   id<MTLCommandQueue> command_queue = memory_info->command_queue;
   ::ml_drift::metal::MetalSpatialTensor& gpu_tensor = memory_info->metal_tensor;
 
+  // Agello telemetry: every write unlock copies the host shadow back to the GPU tensor.
+  ::agello::telemetry::Count(::agello::telemetry::kHostUnlockCopies);
+  ::agello::telemetry::Count(::agello::telemetry::kHostUnlockCopyBytes,
+                             static_cast<int64_t>(memory_info->packed_bytes));
+  ::agello::telemetry::ScopedSpan copy_span(::agello::telemetry::kHostUnlockWrite,
+                                            static_cast<int64_t>(memory_info->packed_bytes));
+  ::agello::telemetry::ScopedSpan size_span(CopySpan(memory_info, /*read=*/false));
   absl::Status absl_status = absl::OkStatus();
   if (memory_info->buffer_type == kLiteRtTensorBufferTypeMetalBufferPacked) {
     WriteDataToBuffer(gpu_tensor.GetBufferHandle(), 0, command_queue, memory_info->host_memory,
@@ -340,8 +367,10 @@ LiteRtStatus LiteRtLockMetalMemory(HwMemoryInfoPtr hw_memory_info, LiteRtTensorB
                              << "The Metal memory is already locked.");
 
   LockState new_lock_state = litert::internal::ToLockState(mode);
+  ::agello::telemetry::Count(::agello::telemetry::kHostLocks);
 
   if (memory_info->host_memory == nullptr) {
+    ::agello::telemetry::Count(::agello::telemetry::kHostShadowAllocs);
     if (memory_info->packed_bytes == 0) {
       ABSL_LOG(ERROR) << "Packed bytes cannot be zero for host memory allocation";
       return kLiteRtStatusErrorInvalidArgument;
@@ -365,6 +394,13 @@ LiteRtStatus LiteRtLockMetalMemory(HwMemoryInfoPtr hw_memory_info, LiteRtTensorB
   id<MTLDevice> metal_device = memory_info->metal_device;
   ::ml_drift::metal::MetalSpatialTensor& gpu_tensor = memory_info->metal_tensor;
 
+  // Agello telemetry: read locks copy the GPU tensor into the host shadow, even on unified memory.
+  ::agello::telemetry::Count(::agello::telemetry::kHostLockCopies);
+  ::agello::telemetry::Count(::agello::telemetry::kHostLockCopyBytes,
+                             static_cast<int64_t>(memory_info->packed_bytes));
+  ::agello::telemetry::ScopedSpan copy_span(::agello::telemetry::kHostLockRead,
+                                            static_cast<int64_t>(memory_info->packed_bytes));
+  ::agello::telemetry::ScopedSpan size_span(CopySpan(memory_info, /*read=*/true));
   absl::Status absl_status = absl::OkStatus();
   if (memory_info->buffer_type == kLiteRtTensorBufferTypeMetalBufferPacked) {
     id<MTLCommandQueue> command_queue = memory_info->command_queue;

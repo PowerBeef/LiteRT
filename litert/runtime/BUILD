@@ -692,6 +692,7 @@ cc_library(
     }),
     linkopts = litert_metal_linkopts(),
     deps = [
+        "@agello_telemetry//:telemetry",
         ":accelerator",
         ":custom_op_dispatcher",
         ":external_litert_buffer_context",

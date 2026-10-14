@@ -58,6 +58,7 @@
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/types/span.h"  // from @com_google_absl
+#include "agello/agello_telemetry.h"  // from @agello_telemetry
 #include "litert/c/internal/litert_accelerator.h"
 #include "litert/c/internal/litert_delegate_wrapper.h"
 #include "litert/c/internal/litert_logging.h"
@@ -1037,6 +1038,8 @@ LiteRtCompiledModelT::Create(LiteRtEnvironmentT* env, LiteRtModel model,
       .partitions = 0,
   };
   int cpu_delegated_node_count = 0;
+  int gpu_delegated_node_count = 0;
+  int gpu_partition_count = 0;
 
   // Apply accelerators matching the requested hardware support to the
   // model in the order they were registered.
@@ -1131,6 +1134,10 @@ LiteRtCompiledModelT::Create(LiteRtEnvironmentT* env, LiteRtModel model,
       if (accelerator_supported_hardware & kLiteRtHwAcceleratorCpu) {
         cpu_delegated_node_count += delegated_ops;
       }
+      if (accelerator_supported_hardware & kLiteRtHwAcceleratorGpu) {
+        gpu_delegated_node_count += delegated_ops;
+        gpu_partition_count += partitions;
+      }
 
       compiled_model->delegation_metrics_.accelerators.push_back(
           LiteRtAcceleratorDelegationMetricsT{
@@ -1148,6 +1155,30 @@ LiteRtCompiledModelT::Create(LiteRtEnvironmentT* env, LiteRtModel model,
       compiled_model->RegisterDelegate({std::move(delegate),
                                         accelerator->StartMetricsCollection,
                                         accelerator->StopMetricsCollection});
+    }
+  }
+
+  // Agello telemetry: delegation coverage per compiled model. A GPU model whose subgraphs don't
+  // each run as one GPU partition pays a CPU round trip (and a host copy) at every boundary.
+  {
+    namespace telemetry = ::agello::telemetry;
+    const int total = compiled_model->delegation_metrics_.total_node_count;
+    const int subgraphs = static_cast<int>(compiled_model->active_subgraph_indices_.size());
+    telemetry::Count(telemetry::kCompiledModels);
+    telemetry::Count(telemetry::kGraphNodes, total);
+    telemetry::Count(telemetry::kGraphNodesGpu, gpu_delegated_node_count);
+    telemetry::Count(telemetry::kGraphNodesCpuDelegate, cpu_delegated_node_count);
+    telemetry::Count(telemetry::kGraphNodesUndelegated, prev_counts.undelegated_nodes);
+    telemetry::Count(telemetry::kGpuPartitions, gpu_partition_count);
+    if ((hardware_accelerators & kLiteRtHwAcceleratorGpu) && total > 0) {
+      if (gpu_delegated_node_count == 0) {
+        telemetry::ReportAnomaly(telemetry::kPartialDelegation, telemetry::kWarning, total, 0,
+                                 "GPU requested but no node runs on the GPU");
+      } else if (gpu_delegated_node_count < total || gpu_partition_count > subgraphs) {
+        telemetry::ReportAnomaly(telemetry::kPartialDelegation, telemetry::kWarning,
+                                 total - gpu_delegated_node_count, gpu_partition_count,
+                                 "GPU model split: a = nodes off the GPU, b = GPU partitions");
+      }
     }
   }
 

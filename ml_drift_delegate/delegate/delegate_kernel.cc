@@ -40,6 +40,7 @@
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/synchronization/blocking_counter.h"  // from @com_google_absl
 #include "absl/types/span.h"  // from @com_google_absl
+#include "agello/agello_telemetry.h"  // from @agello_telemetry
 // copybara:uncomment #include "mediapipe/framework/profiler/perfetto_profiling.h"  // from @mediapipe
 #include "ml_drift/common/data_type.h"  // from @ml_drift
 #include "ml_drift/common/gpu_info.h"  // from @ml_drift
@@ -555,6 +556,11 @@ absl::Status DelegateKernel::InitializeExternalSharedConstantTensors(
       }
 
       if (!uncached_tensor_ids.empty()) {
+        ::agello::telemetry::ReportAnomaly(
+            ::agello::telemetry::kWeightCacheRebuild, ::agello::telemetry::kWarning,
+            static_cast<int64_t>(uncached_tensor_ids.size()),
+            static_cast<int64_t>(prepared_tensor_ids.size()),
+            "weights missing from a read-only cache are prepared on every load (a of b)");
         ABSL_LOG(WARNING)
             << uncached_tensor_ids.size() << " out of "
             << prepared_tensor_ids.size()
@@ -897,6 +903,7 @@ absl::Status DelegateKernel::InitInferenceContextFromSerializedData(
       absl::Status validity = ValidateRestoredInferenceContext();
       if (validity.ok()) {
         ABSL_LOG(INFO) << "Initialized InferenceContext from serialized data.";
+        ::agello::telemetry::Count(::agello::telemetry::kProgramCacheHits);
         return absl::OkStatus();
       }
       // The entry deserialized but describes a different model than the one
@@ -904,10 +911,19 @@ absl::Status DelegateKernel::InitInferenceContextFromSerializedData(
       // rebuilt context overwrites the stale entry under the same key.
       ctx_.reset();
       ABSL_LOG(WARNING) << "Discarding stale program cache entry: " << validity;
+      ::agello::telemetry::ReportAnomaly(::agello::telemetry::kProgramCacheRebuild,
+                                         ::agello::telemetry::kWarning, 0, 0,
+                                         "stale program cache entry; rebuilding the GPU program");
     } else {
       ABSL_LOG(WARNING) << "Deserialization failed: " << res.status();
+      ::agello::telemetry::ReportAnomaly(::agello::telemetry::kProgramCacheRebuild,
+                                         ::agello::telemetry::kWarning,
+                                         static_cast<int64_t>(res.status().code()), 0,
+                                         "program cache entry failed to deserialize; rebuilding");
     }
     // If the restore fails, fallback to the default graph initialization.
+  } else {
+    ::agello::telemetry::Count(::agello::telemetry::kProgramCacheMisses);
   }
 
   //  Init InferenceContext and serialize it.
@@ -1079,6 +1095,15 @@ DelegateKernel::TryInitializingExternalTensorsSerialization(
         unique_model_identifier);
   }
 
+  if (load_status.ok()) {
+    ::agello::telemetry::Count(::agello::telemetry::kWeightCacheHits);
+  } else if (load_status.code() != absl::StatusCode::kUnimplemented) {
+    ::agello::telemetry::Count(::agello::telemetry::kWeightCacheMisses);
+    ::agello::telemetry::ReportAnomaly(::agello::telemetry::kWeightCacheRebuild,
+                                       ::agello::telemetry::kInfo,
+                                       static_cast<int64_t>(load_status.code()), 0,
+                                       "GPU weight cache not loaded; converting weights again");
+  }
   if (!load_status.ok() &&
       load_status.code() != absl::StatusCode::kUnimplemented) {
     if (has_valid_fd) {
@@ -1447,6 +1472,7 @@ absl::Status DelegateKernel::InitInferenceContextFromSerializedData(
       absl::Status validity = ValidateRestoredInferenceContext();
       if (validity.ok()) {
         ABSL_LOG(INFO) << "Initialized InferenceContext from serialized data.";
+        ::agello::telemetry::Count(::agello::telemetry::kProgramCacheHits);
         return absl::OkStatus();
       }
       // The entry deserialized but describes a different model than the one
@@ -1454,10 +1480,19 @@ absl::Status DelegateKernel::InitInferenceContextFromSerializedData(
       // rebuilt context overwrites the stale entry under the same key.
       ctx_.reset();
       ABSL_LOG(WARNING) << "Discarding stale program cache entry: " << validity;
+      ::agello::telemetry::ReportAnomaly(::agello::telemetry::kProgramCacheRebuild,
+                                         ::agello::telemetry::kWarning, 0, 0,
+                                         "stale program cache entry; rebuilding the GPU program");
     } else {
       ABSL_LOG(WARNING) << "Deserialization failed: " << res.status();
+      ::agello::telemetry::ReportAnomaly(::agello::telemetry::kProgramCacheRebuild,
+                                         ::agello::telemetry::kWarning,
+                                         static_cast<int64_t>(res.status().code()), 0,
+                                         "program cache entry failed to deserialize; rebuilding");
     }
     // If the restore fails, fallback to the default graph initialization.
+  } else {
+    ::agello::telemetry::Count(::agello::telemetry::kProgramCacheMisses);
   }
 
   //  Init InferenceContext and serialize it.
