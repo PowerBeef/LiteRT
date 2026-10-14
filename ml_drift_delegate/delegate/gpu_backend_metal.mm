@@ -504,8 +504,11 @@ absl::Status GpuInferenceContextMetal::ReadWeightTensorToDescriptor(
 }
 
 absl::Status GpuInferenceContextMetal::Dispatch() {
-  // If it will be waiting actively, enqueue commands into multiple command buffers.
-  if (backend_->wait_type() == kGpuDelegateWaitTypeActive) {
+  // Enqueue commands into multiple command buffers, committed as they're encoded, so the GPU
+  // starts before the whole graph is encoded. Agello: passive waits too (they used to encode the
+  // graph into one command buffer and commit it at the end, leaving the GPU idle while encoding:
+  // ~0.6 ms per decode step on the M6). Only DoNotWait keeps one buffer, for its events.
+  if (backend_->wait_type() != kGpuDelegateWaitTypeDoNotWait) {
     // Commit the previous command buffer if any.
     if (backend_->command_buffer() != nullptr) {
       ::agello::telemetry::AttachGpuTiming(backend_->command_buffer());
