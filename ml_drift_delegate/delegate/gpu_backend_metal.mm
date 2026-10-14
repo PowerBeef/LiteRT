@@ -164,7 +164,22 @@ void GpuBackendMetal::SetResidencyRuntimeEnabled(bool enabled) {
 
 absl::string_view GpuBackendMetal::GetSerializedDataPrefix() { return kSerializedDataPrefix; }
 
-absl::StatusOr<::ml_drift::GpuInfo> GpuBackendMetal::GetInfo() { return device_->GetInfo(); }
+absl::StatusOr<::ml_drift::GpuInfo> GpuBackendMetal::GetInfo() {
+  const ::ml_drift::GpuInfo& info = device_->GetInfo();
+  // Agello telemetry: ML Drift infers the GPU family from the device name and falls back to
+  // Apple1 (no simdgroup matrices, no Neural Accelerator kernels) for names it doesn't know.
+  const int family = static_cast<int>(info.apple_info.gpu_family);
+  const bool unknown = info.apple_info.gpu_type == ::ml_drift::AppleGpu::kUnknown;
+  ::agello::telemetry::SetFact(
+      "gpu", std::string(device_->device().name.UTF8String) + ", ML Drift family Apple" +
+                 std::to_string(family) + (unknown ? " (device not recognized)" : ""));
+  if (unknown) {
+    ::agello::telemetry::ReportAnomaly(::agello::telemetry::kGpuFamilyUnknown,
+                                       ::agello::telemetry::kError, family, 0,
+                                       "ML Drift doesn't recognize this GPU: slow fallback kernels");
+  }
+  return info;
+}
 
 absl::StatusOr<::ml_drift::TensorStorageType> GpuBackendMetal::GetFastestStorageType() {
   return ::ml_drift::metal::GetFastestStorageType(device_->GetInfo());
@@ -203,6 +218,12 @@ absl::Status GpuBackendMetal::WaitForCompletion() {
 
   ::agello::telemetry::AttachGpuTiming(command_buffer_);
   ::agello::telemetry::Count(::agello::telemetry::kGpuWaits);
+  if (::agello::telemetry::Enabled(::agello::telemetry::kCounters)) {
+    ::agello::telemetry::SetFact(
+        "metal_wait", wait_type_ == kGpuDelegateWaitTypeActive    ? "active (busy-wait)"
+                      : wait_type_ == kGpuDelegateWaitTypePassive ? "passive (waitUntilCompleted)"
+                                                                  : "do not wait");
+  }
   ::agello::telemetry::ScopedSpan wait_span(::agello::telemetry::GpuWaitSpanForCurrentRun());
   [command_buffer_ commit];
 
