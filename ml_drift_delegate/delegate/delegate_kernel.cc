@@ -109,6 +109,13 @@ constexpr bool kForceCompletion = false;
 
 // Agello (T11): one weight cache entry per subgraph for every context size,
 // unless AGELLO_SHARED_WEIGHT_CACHE=0 (for A/B measurements).
+// Agello: the GPU ML Drift is told to simulate (AGELLO_SIMULATE_APPLE_GPU), empty when none. Its
+// kernels and weight layouts differ from this device's, so it joins both cache keys.
+std::string SimulatedAppleGpu() {
+  const char* value = std::getenv("AGELLO_SIMULATE_APPLE_GPU");
+  return value == nullptr ? std::string() : std::string(value);
+}
+
 bool SharedWeightCacheEnabled() {
   static const bool enabled = [] {
     const char* value = std::getenv("AGELLO_SHARED_WEIGHT_CACHE");
@@ -850,6 +857,9 @@ std::string DelegateKernel::ComputeOptionsFingerprint() const {
   // Keeps entries built for one backend from being restored by another; the
   // program cache file itself is keyed only by the model token.
   absl::StrAppend(&options_fingerprint, backend_->GetBackendName());
+  if (const std::string simulated = SimulatedAppleGpu(); !simulated.empty()) {
+    absl::StrAppend(&options_fingerprint, "|agello-simulated-gpu=", simulated);
+  }
   // Agello (T4): the bounded attention rewrite changes the GPU program.
   if (BoundedAttentionEnabled()) {
     absl::StrAppend(&options_fingerprint, "|agello-bounded-attention-2",
@@ -1088,7 +1098,7 @@ DelegateKernel::TryInitializingExternalTensorsSerialization(
            ? ::ml_drift::SerializationWeightCache::GenerateContentModelIdentifier
            : ::ml_drift::SerializationWeightCache::GenerateUniqueModelIdentifier)(
           delegate_data_->model_token, context, delegate_params,
-          backend_->GetSerializedDataPrefix(),
+          absl::StrCat(backend_->GetSerializedDataPrefix(), SimulatedAppleGpu()),
           delegate_data_->options->precision,
           delegate_data_->options->prefer_texture_weights,
           delegate_data_->options->allow_src_quantized_fc_conv_ops,
