@@ -530,6 +530,7 @@ cc_library(
     srcs = ["delegate_kernel.cc"],
     hdrs = ["delegate_kernel.h"],
     deps = [
+        "//ml_drift_delegate/delegate/composite:bounded_attention",
         "@agello_telemetry//:telemetry",
         ":delegate_data",
         ":delegate_options",

@@ -69,13 +69,28 @@ absl::Status BuildRuntimeBatchedMatMulGpuGraph(
       if (input_ids.size() < 3) {
         return absl::InvalidArgumentError("Missing runtime check tensor.");
       }
-      if (input_ids.size() > 3) {
-        ABSL_ASSIGN_OR_RETURN(bias, model_builder->GetTensor(input_ids[2]));
-        bias_ptr = &bias;
-      }
-      if (input_ids.size() > 4) {
-        ABSL_ASSIGN_OR_RETURN(src_exp, model_builder->GetTensor(input_ids[3]));
+      if (attr.src_exp_input) {
+        // Agello (T4): [src, weights, (bias,) src_exp, params].
+        if (input_ids.size() < 4) {
+          return absl::InvalidArgumentError("Missing src_exp tensor.");
+        }
+        if (input_ids.size() > 4) {
+          ABSL_ASSIGN_OR_RETURN(bias, model_builder->GetTensor(input_ids[2]));
+          bias_ptr = &bias;
+        }
+        ABSL_ASSIGN_OR_RETURN(
+            src_exp, model_builder->GetTensor(input_ids[input_ids.size() - 2]));
         src_exp_ptr = &src_exp;
+      } else {
+        if (input_ids.size() > 3) {
+          ABSL_ASSIGN_OR_RETURN(bias, model_builder->GetTensor(input_ids[2]));
+          bias_ptr = &bias;
+        }
+        if (input_ids.size() > 4) {
+          ABSL_ASSIGN_OR_RETURN(src_exp,
+                                model_builder->GetTensor(input_ids[3]));
+          src_exp_ptr = &src_exp;
+        }
       }
       ABSL_ASSIGN_OR_RETURN(
           runtime_check_tensor,

@@ -66,6 +66,7 @@
 #include "ml_drift_delegate/delegate/serialization_weight_cache/serialization_weight_cache.h"
 // clang-format on
 #include "ml_drift_delegate/delegate/composite/custom_parsers.h"
+#include "ml_drift_delegate/delegate/composite/bounded_attention.h"
 #include "ml_drift_delegate/delegate/composite/custom_transformations.h"
 #include "ml_drift_delegate/delegate/composite/gated_delta_update_parser.h"
 #include "ml_drift_delegate/delegate/composite/ir/custom_parsers.h"
@@ -838,6 +839,10 @@ std::string DelegateKernel::ComputeOptionsFingerprint() const {
   // Keeps entries built for one backend from being restored by another; the
   // program cache file itself is keyed only by the model token.
   absl::StrAppend(&options_fingerprint, backend_->GetBackendName());
+  // Agello (T4): the bounded attention rewrite changes the GPU program.
+  if (BoundedAttentionEnabled()) {
+    absl::StrAppend(&options_fingerprint, "|agello-bounded-attention-1");
+  }
   return options_fingerprint;
 }
 

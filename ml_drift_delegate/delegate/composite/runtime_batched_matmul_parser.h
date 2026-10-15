@@ -54,6 +54,9 @@ struct RuntimeBatchedMatMulAttributes {
   std::optional<
       ::ml_drift::Tensor<::ml_drift::Linear, ::ml_drift::DataType::kFloat32>>
       scale;
+  // Agello (T4, bounded_attention.h): the FC case reads a softmax reduction as
+  // src_exp, the input before params: [src, weights, (bias,) src_exp, params].
+  bool src_exp_input = false;
 };
 
 class RuntimeBatchedMatMulOperationParser : public TFLiteOperationParser {

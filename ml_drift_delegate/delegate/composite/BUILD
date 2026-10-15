@@ -519,11 +519,44 @@ cc_test(
     ],
 )
 
+# Agello (T4): attention select and softmax bounded to the filled KV length.
+cc_library(
+    name = "bounded_attention",
+    srcs = ["bounded_attention.cc"],
+    hdrs = ["bounded_attention.h"],
+    deps = [
+        ":runtime_batched_matmul_parser",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@ml_drift//ml_drift/common:data_type",
+        "@ml_drift//ml_drift/common:model",
+        "@ml_drift//ml_drift/common:operations",
+        "@ml_drift//ml_drift/common:shape",
+    ],
+)
+
+cc_library(
+    name = "bounded_attention_kernel",
+    srcs = ["bounded_attention_kernel.cc"],
+    hdrs = ["bounded_attention_kernel.h"],
+    deps = [
+        ":bounded_attention",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@ml_drift//ml_drift/common:gpu_model_builder",
+        "@ml_drift//ml_drift/common:model",
+        "@ml_drift//ml_drift/common/task:gpu_operation",
+    ],
+)
+
 cc_library(
     name = "custom_transformations",
     srcs = ["custom_transformations.cc"],
     hdrs = ["custom_transformations.h"],
     deps = [
+        "@com_google_absl//absl/log:absl_log",
+        ":bounded_attention",
         ":fuse_qkv_norm_rope",
         ":fuse_sdpa_transposed_reshape",
         ":fuse_short_conv_step",
@@ -799,6 +832,8 @@ cc_library(
     srcs = ["litert_op_selector.cc"],
     hdrs = ["litert_op_selector.h"],
     deps = [
+        ":bounded_attention_kernel",
+        ":bounded_attention",
         ":add_values_to_cache_kernel",
         ":add_values_to_cache_parser",
         ":gated_delta_update_kernel",

@@ -43,6 +43,8 @@
 #include "ml_drift_delegate/delegate/composite/moe_experts_parser.h"
 #include "ml_drift_delegate/delegate/composite/qkv_norm_rope_kernel.h"
 #include "ml_drift_delegate/delegate/composite/qkv_norm_rope_parser.h"
+#include "ml_drift_delegate/delegate/composite/bounded_attention.h"
+#include "ml_drift_delegate/delegate/composite/bounded_attention_kernel.h"
 #include "ml_drift_delegate/delegate/composite/runtime_batched_matmul_kernel.h"
 #include "ml_drift_delegate/delegate/composite/runtime_batched_matmul_parser.h"
 #include "ml_drift_delegate/delegate/composite/sdpa_transposed_kernel.h"
@@ -169,6 +171,22 @@ absl::Status LiteRtOpSelector::GPUOperationFromNode(
   if (node.operation.type == kGatedDeltaUpdateType) {
     return CreateGatedDeltaUpdateFromNode(op_def, inputs, outputs, node,
                                           &gpu_info_, model_builder);
+  }
+  // Agello (T4): the bounded attention tail (bounded_attention.h).
+  if (node.operation.type == kBoundedMaskType) {
+    return CreateBoundedMaskFromNode(inputs, outputs, node, model_builder);
+  }
+  if (node.operation.type == kBoundedSoftmaxReduceType) {
+    std::vector<::ml_drift::Value*> reduce_inputs = inputs;
+    if (inputs.size() == 2) {
+      // Ensure param tensor is a buffer tensor as kernel programs expect so.
+      ParamTensorToBuffer(1, inputs, model_builder);
+      if (replaced_tensors_.contains(inputs[1]->id)) {
+        reduce_inputs[1] = replaced_tensors_[inputs[1]->id].get();
+      }
+    }
+    return CreateBoundedSoftmaxReduceFromNode(reduce_inputs, outputs, node,
+                                              model_builder);
   }
   if (node.operation.type == kRuntimeBatchedMatMulType) {
     std::vector<::ml_drift::Value*> bmm_inputs = inputs;

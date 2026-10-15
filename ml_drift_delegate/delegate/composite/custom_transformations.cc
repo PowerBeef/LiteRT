@@ -15,9 +15,11 @@
 #include "ml_drift_delegate/delegate/composite/custom_transformations.h"
 
 #include "absl/status/status.h"  // from @com_google_absl
+#include "absl/log/absl_log.h"  // from @com_google_absl
 #include "absl/status/status_macros.h"  // from @com_google_absl
 #include "ml_drift/common/ir_model.h"  // from @ml_drift
 #include "ml_drift/common/model.h"  // from @ml_drift
+#include "ml_drift_delegate/delegate/composite/bounded_attention.h"
 #include "ml_drift_delegate/delegate/composite/fuse_qkv_norm_rope.h"
 #include "ml_drift_delegate/delegate/composite/fuse_sdpa_transposed_reshape.h"
 #include "ml_drift_delegate/delegate/composite/fuse_short_conv_step.h"
@@ -37,6 +39,13 @@ absl::Status ApplyCustomTransformations(
     ABSL_RETURN_IF_ERROR(FuseShortConvStep(graph));
   }
   ABSL_RETURN_IF_ERROR(FuseSdpaTransposedReshape(graph));
+  // Agello (T4): bound attention select and softmax to the filled KV length.
+  if (BoundedAttentionEnabled()) {
+    ABSL_ASSIGN_OR_RETURN(const int rewritten, FuseBoundedAttentionSoftmax(graph));
+    if (rewritten > 0) {
+      ABSL_LOG(INFO) << "Bounded " << rewritten << " attention softmaxes to the filled KV length.";
+    }
+  }
   return absl::OkStatus();
 }
 
