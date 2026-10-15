@@ -243,3 +243,15 @@ cc_library(
     hdrs = ["testing_util.h"],
     deps = ["@com_google_absl//absl/strings:string_view"],
 )
+
+# Agello (T11): the content identifier, with the open-source googletest.
+cc_test(
+    name = "content_identifier_test",
+    srcs = ["content_identifier_test.cc"],
+    deps = [
+        ":serialization_weight_cache",
+        "//ml_drift_delegate/delegate:precision",
+        "//tflite/c:common",
+        "@com_google_googletest//:gtest_main",
+    ],
+)

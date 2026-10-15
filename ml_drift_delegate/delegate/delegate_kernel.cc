@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <any>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <memory>
@@ -105,6 +106,16 @@ constexpr bool kForceCompletion = true;
 #else
 constexpr bool kForceCompletion = false;
 #endif
+
+// Agello (T11): one weight cache entry per subgraph for every context size,
+// unless AGELLO_SHARED_WEIGHT_CACHE=0 (for A/B measurements).
+bool SharedWeightCacheEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("AGELLO_SHARED_WEIGHT_CACHE");
+    return value == nullptr || std::string(value) != "0";
+  }();
+  return enabled;
+}
 
 }  // namespace
 
@@ -1073,7 +1084,9 @@ DelegateKernel::TryInitializingExternalTensorsSerialization(
 
   // Create a unique identifier for this subgraph.
   uint64_t unique_model_identifier =
-      ::ml_drift::SerializationWeightCache::GenerateUniqueModelIdentifier(
+      (SharedWeightCacheEnabled()
+           ? ::ml_drift::SerializationWeightCache::GenerateContentModelIdentifier
+           : ::ml_drift::SerializationWeightCache::GenerateUniqueModelIdentifier)(
           delegate_data_->model_token, context, delegate_params,
           backend_->GetSerializedDataPrefix(),
           delegate_data_->options->precision,

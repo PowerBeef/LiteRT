@@ -166,6 +166,20 @@ class SerializationWeightCache {
       bool allow_src_quantized_fc_conv_ops, bool prepare_weights_in_batches,
       bool serialize_external_tensors, bool ordered_by_size);
 
+  // Agello (T11): GenerateUniqueModelIdentifier without the tensor sizes that
+  // TFLite's fingerprint takes from the subgraph (the first 100 tensors, the
+  // partition's inputs and outputs), which include the KV caches: every
+  // context size stored its own copy of the same weights (2.2 GB each for
+  // Gemma 4 E4B). Converted weights depend on the model, the options, the
+  // delegated nodes and their constant inputs, which this covers.
+  static uint64_t GenerateContentModelIdentifier(
+      absl::string_view model_token, TfLiteContext* context,
+      const TfLiteDelegateParams* delegate_params,
+      absl::string_view serialization_prefix,
+      const MlDriftDelegatePrecision& precision, bool prefer_texture_weights,
+      bool allow_src_quantized_fc_conv_ops, bool prepare_weights_in_batches,
+      bool serialize_external_tensors, bool ordered_by_size);
+
  private:
   friend class SerializationWeightCacheTestPeer;
 

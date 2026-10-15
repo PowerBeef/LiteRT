@@ -528,4 +528,47 @@ uint64_t SerializationWeightCache::GenerateUniqueModelIdentifier(
       model_token.data(), custom_key, context, delegate_params);
 }
 
+uint64_t SerializationWeightCache::GenerateContentModelIdentifier(
+    absl::string_view model_token, TfLiteContext* context,
+    const TfLiteDelegateParams* delegate_params,
+    absl::string_view serialization_prefix,
+    const MlDriftDelegatePrecision& precision, bool prefer_texture_weights,
+    bool allow_src_quantized_fc_conv_ops, bool prepare_weights_in_batches,
+    bool serialize_external_tensors, bool ordered_by_size) {
+  // The model token and the options alone.
+  const uint64_t base = GenerateUniqueModelIdentifier(
+      model_token, /*context=*/nullptr, /*delegate_params=*/nullptr,
+      serialization_prefix, precision, prefer_texture_weights,
+      allow_src_quantized_fc_conv_ops, prepare_weights_in_batches,
+      serialize_external_tensors, ordered_by_size);
+  if (context == nullptr || delegate_params == nullptr) return base;
+  // Each delegated node, its op, and its constant inputs (index, size, type).
+  std::vector<int64_t> data;
+  const TfLiteIntArray* nodes = delegate_params->nodes_to_replace;
+  for (int i = 0; i < nodes->size; ++i) {
+    const int node_index = nodes->data[i];
+    data.push_back(node_index);
+    TfLiteNode* node = nullptr;
+    TfLiteRegistration* registration = nullptr;
+    if (context->GetNodeAndRegistration(context, node_index, &node,
+                                        &registration) != kTfLiteOk) {
+      data.push_back(-1);
+      continue;
+    }
+    data.push_back(registration->builtin_code);
+    for (int j = 0; j < node->inputs->size; ++j) {
+      const int tensor_index = node->inputs->data[j];
+      if (tensor_index < 0) continue;
+      const TfLiteTensor& tensor = context->tensors[tensor_index];
+      if (tensor.allocation_type != kTfLiteMmapRo) continue;
+      data.push_back(tensor_index);
+      data.push_back(static_cast<int64_t>(tensor.bytes));
+      data.push_back(static_cast<int64_t>(tensor.type));
+    }
+  }
+  return CombineFingerprints(
+      base, Fingerprint64(reinterpret_cast<const char*>(data.data()),
+                          data.size() * sizeof(int64_t)));
+}
+
 }  // namespace ml_drift
