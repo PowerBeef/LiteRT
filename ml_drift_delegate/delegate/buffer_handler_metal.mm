@@ -13,6 +13,10 @@
 // limitations under the License.
 
 #import <Metal/Metal.h>
+#include "ml_drift/common/data_type.h"  // from @ml_drift
+#include "ml_drift/common/shape.h"  // from @ml_drift
+#include "ml_drift/common/task/tensor_desc.h"  // from @ml_drift
+#include "ml_drift/common/util.h"  // from @ml_drift
 #include "ml_drift/metal/buffer.h"  // from @ml_drift
 #include "ml_drift/metal/common.h"  // from @ml_drift
 #include "ml_drift/metal/metal_device.h"  // from @ml_drift
@@ -24,6 +28,7 @@
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "absl/cleanup/cleanup.h"  // from @com_google_absl
 #include "absl/log/absl_log.h"  // from @com_google_absl
@@ -69,19 +74,93 @@ struct MetalMemoryInfo : public HwMemoryInfo {
   int write_span = -2;
 };
 
-// Agello telemetry: the span for this buffer's copies in one direction, named by size so a report
-// can tell the tensors apart (logits, embeddings, masks...). -1 below level 2.
-int CopySpan(MetalMemoryInfo* memory_info, bool read) {
+// Agello telemetry: the span for this buffer's copies in one direction, named by size and path
+// so a report can tell the tensors apart (logits, embeddings, masks...). -1 below level 2.
+int CopySpan(MetalMemoryInfo* memory_info, bool read, const char* path) {
   if (!::agello::telemetry::Enabled(::agello::telemetry::kSpans)) return -1;
   int& span = read ? memory_info->read_span : memory_info->write_span;
   if (span == -2) {
-    const bool packed = memory_info->buffer_type == kLiteRtTensorBufferTypeMetalBufferPacked;
     const std::string name = std::string(read ? "host.read " : "host.write ") +
-                             std::to_string(memory_info->packed_bytes) + " B" +
-                             (packed ? "" : " (converted)");
+                             std::to_string(memory_info->packed_bytes) + " B" + path;
     span = ::agello::telemetry::InternSpan(name.c_str());
   }
   return span;
+}
+
+// Agello: whether a GPU tensor can be read straight into host memory by ReadLinearBufferDirect:
+// linear buffer storage the CPU can see, holding the host element type itself.
+bool CanReadLinearBufferDirect(const ::ml_drift::metal::MetalSpatialTensor& tensor,
+                               LiteRtElementType element_type, size_t host_bytes) {
+  const ::ml_drift::TensorDescriptor desc = tensor.GetDescriptor();
+  const ::ml_drift::TensorStorageType storage = desc.GetStorageType();
+  if (storage != ::ml_drift::TensorStorageType::kBuffer &&
+      storage != ::ml_drift::TensorStorageType::kImageBuffer) {
+    return false;
+  }
+  const ::ml_drift::DataType data_type = desc.GetDataType();
+  const bool same_type =
+      (data_type == ::ml_drift::DataType::kFloat16 &&
+       element_type == kLiteRtElementTypeFloat16) ||
+      (data_type == ::ml_drift::DataType::kFloat32 &&
+       element_type == kLiteRtElementTypeFloat32) ||
+      (data_type == ::ml_drift::DataType::kInt32 && element_type == kLiteRtElementTypeInt32);
+  id<MTLBuffer> buffer = tensor.GetBufferHandle();
+  return same_type && buffer != nil && buffer.storageMode == MTLStorageModeShared &&
+         static_cast<size_t>(desc.GetBHWDCShape().DimensionsProduct()) *
+                 ::ml_drift::SizeOf(data_type) ==
+             host_bytes;
+}
+
+// Agello: reads a linear buffer tensor into host memory in BHWDC order, the order ML Drift's
+// DataToBHWDC produces, without its generic download (a zero-filled copy of the whole tensor,
+// then an index computation per element). Both linear layouts place a slice's four channels side
+// by side and are affine in the slice, so each row is one memcpy (CC4) or one copy per slice.
+void ReadLinearBufferDirect(const ::ml_drift::metal::MetalSpatialTensor& tensor,
+                            void* host_memory) {
+  const ::ml_drift::TensorDescriptor desc = tensor.GetDescriptor();
+  const ::ml_drift::BHWDC shape = desc.GetBHWDCShape();
+  const size_t element = ::ml_drift::SizeOf(desc.GetDataType());
+  const int slices = ::ml_drift::DivideRoundUp(shape.c, 4);
+  const int full_slices = shape.c / 4;
+  const size_t tail = (shape.c % 4) * element;
+  const uint8_t* src = static_cast<const uint8_t*>(tensor.GetBufferPointer());
+  uint8_t* dst = static_cast<uint8_t*>(host_memory);
+  for (int b = 0; b < shape.b; ++b) {
+    for (int y = 0; y < shape.h; ++y) {
+      for (int x = 0; x < shape.w; ++x) {
+        for (int d = 0; d < shape.d; ++d) {
+          const int64_t base = desc.GetLinearIndex(shape, b, x, y, d, 0, 0);
+          const int64_t stride =
+              slices > 1 ? desc.GetLinearIndex(shape, b, x, y, d, 1, 0) - base : 4;
+          const uint8_t* from = src + base * element;
+          uint8_t* row = dst + shape.LinearIndex({b, y, x, d, 0}) * element;
+          if (stride == 4) {
+            std::memcpy(row, from, shape.c * element);
+            continue;
+          }
+          const size_t step = stride * element;
+          if (element == 2) {
+            for (int s = 0; s < full_slices; ++s) std::memcpy(row + s * 8, from + s * step, 8);
+          } else {
+            for (int s = 0; s < full_slices; ++s) {
+              std::memcpy(row + s * 4 * element, from + s * step, 4 * element);
+            }
+          }
+          if (tail) std::memcpy(row + full_slices * 4 * element, from + full_slices * step, tail);
+        }
+      }
+    }
+  }
+}
+
+// Agello: AGELLO_VERIFY_DIRECT_READ=1 also runs ML Drift's download after each direct read and
+// reports an error anomaly if the bytes differ.
+bool VerifyDirectReads() {
+  static const bool verify = [] {
+    const char* value = std::getenv("AGELLO_VERIFY_DIRECT_READ");
+    return value != nullptr && value[0] == '1';
+  }();
+  return verify;
 }
 
 
@@ -339,7 +418,9 @@ LiteRtStatus LiteRtUnlockMetalMemory(HwMemoryInfoPtr hw_memory_info) {
                              static_cast<int64_t>(memory_info->packed_bytes));
   ::agello::telemetry::ScopedSpan copy_span(::agello::telemetry::kHostUnlockWrite,
                                             static_cast<int64_t>(memory_info->packed_bytes));
-  ::agello::telemetry::ScopedSpan size_span(CopySpan(memory_info, /*read=*/false));
+  ::agello::telemetry::ScopedSpan size_span(CopySpan(
+      memory_info, /*read=*/false,
+      memory_info->buffer_type == kLiteRtTensorBufferTypeMetalBufferPacked ? "" : " (converted)"));
   absl::Status absl_status = absl::OkStatus();
   if (memory_info->buffer_type == kLiteRtTensorBufferTypeMetalBufferPacked) {
     WriteDataToBuffer(gpu_tensor.GetBufferHandle(), 0, command_queue, memory_info->host_memory,
@@ -400,12 +481,33 @@ LiteRtStatus LiteRtLockMetalMemory(HwMemoryInfoPtr hw_memory_info, LiteRtTensorB
                              static_cast<int64_t>(memory_info->packed_bytes));
   ::agello::telemetry::ScopedSpan copy_span(::agello::telemetry::kHostLockRead,
                                             static_cast<int64_t>(memory_info->packed_bytes));
-  ::agello::telemetry::ScopedSpan size_span(CopySpan(memory_info, /*read=*/true));
+  const bool packed = memory_info->buffer_type == kLiteRtTensorBufferTypeMetalBufferPacked;
+  const bool direct =
+      !packed && CanReadLinearBufferDirect(gpu_tensor, memory_info->tensor_type.element_type,
+                                           memory_info->packed_bytes);
+  ::agello::telemetry::ScopedSpan size_span(
+      CopySpan(memory_info, /*read=*/true, packed ? "" : direct ? " (direct)" : " (converted)"));
   absl::Status absl_status = absl::OkStatus();
-  if (memory_info->buffer_type == kLiteRtTensorBufferTypeMetalBufferPacked) {
+  if (packed) {
     id<MTLCommandQueue> command_queue = memory_info->command_queue;
     ReadDataFromBuffer(gpu_tensor.GetBufferHandle(), 0, command_queue, memory_info->host_memory,
                        memory_info->packed_bytes);
+  } else if (direct) {
+    ReadLinearBufferDirect(gpu_tensor, memory_info->host_memory);
+    if (VerifyDirectReads()) {
+      std::vector<uint8_t> reference(memory_info->packed_bytes);
+      ::ml_drift::TensorDescriptor descriptor_with_data = gpu_tensor.GetDescriptor();
+      if (gpu_tensor.ToDescriptor(&descriptor_with_data, metal_device).ok()) {
+        ::litert::ml_drift::ConvertDataFromDescriptor(descriptor_with_data, reference.data(),
+                                                      memory_info->tensor_type.element_type);
+        if (std::memcmp(reference.data(), memory_info->host_memory, reference.size()) != 0) {
+          ::agello::telemetry::ReportAnomaly(
+              ::agello::telemetry::kNumerics, ::agello::telemetry::kError,
+              static_cast<int64_t>(reference.size()), 0,
+              "direct buffer read differs from ML Drift's download");
+        }
+      }
+    }
   } else {
     // TODO: b/413431454 - Use Tensor Converter for better performance.
     ::ml_drift::TensorDescriptor descriptor_with_data = gpu_tensor.GetDescriptor();

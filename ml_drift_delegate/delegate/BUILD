@@ -1000,6 +1000,10 @@ objc_library(
     # Required to prevent build errors when this target is reachable from the deps of Swift targets.
     aspect_hints = ["//tools/build_defs/swift:no_module"],
     deps = [
+        "@ml_drift//ml_drift/common/task:tensor_desc",
+        "@ml_drift//ml_drift/common:util",
+        "@ml_drift//ml_drift/common:shape",
+        "@ml_drift//ml_drift/common:data_type",
         "@agello_telemetry//:telemetry",
         ":buffer_handler_metal_headers",
         ":buffer_handler_utils",
