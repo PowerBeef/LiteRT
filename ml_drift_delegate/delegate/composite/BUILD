@@ -536,6 +536,20 @@ cc_library(
     ],
 )
 
+cc_test(
+    name = "bounded_attention_test",
+    srcs = ["bounded_attention_test.cc"],
+    deps = [
+        ":bounded_attention",
+        ":runtime_batched_matmul_parser",
+        "@com_google_googletest//:gtest_main",
+        "@ml_drift//ml_drift/common:data_type",
+        "@ml_drift//ml_drift/common:model",
+        "@ml_drift//ml_drift/common:operations",
+        "@ml_drift//ml_drift/common:shape",
+    ],
+)
+
 cc_library(
     name = "bounded_attention_kernel",
     srcs = ["bounded_attention_kernel.cc"],
