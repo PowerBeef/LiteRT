@@ -15,6 +15,7 @@
 #include "ml_drift_delegate/delegate/composite/bounded_attention.h"
 
 #include <any>
+#include <optional>
 
 #include <gtest/gtest.h>
 #include "ml_drift/common/data_type.h"  // from @ml_drift
@@ -63,7 +64,29 @@ struct Attention {
   Node* pv;
 };
 
-void Build(Attention& a) {
+// A sliding-window mask: LOGICAL_AND(GREATER_EQUAL(p, keys), LESS(p, keys + window)).
+void AddWindowMask(GraphFloat32& g, int keys, int window, int offset_of_last = 0) {
+  Value* position = NewValue(g, DataType::kInt32, BHWC(1, 1, 1, 1));
+  auto constant = [&](int shift, int last_extra) {
+    Value* value = NewValue(g, DataType::kInt32, BHWC(1, 1, 1, keys));
+    Node* node = g.NewNode();
+    node->operation.type = ToString(OperationType::kConstant);
+    ::ml_drift::TensorInt32 tensor;
+    tensor.shape = BHWC(1, 1, 1, keys);
+    for (int k = 0; k < keys; ++k) tensor.data.push_back(k + shift + (k == keys - 1 ? last_extra : 0));
+    node->operation.attributes = ::ml_drift::ConstTensorAttributes{tensor};
+    g.SetProducer(node->id, value->id);
+    return value;
+  };
+  Value* ge = NewValue(g, DataType::kBool, BHWC(1, 1, 1, keys));
+  NewNode(g, ToString(OperationType::kGreaterEqual), {position, constant(0, 0)}, ge);
+  Value* lt = NewValue(g, DataType::kBool, BHWC(1, 1, 1, keys));
+  NewNode(g, ToString(OperationType::kLess), {position, constant(window, offset_of_last)}, lt);
+  Value* both = NewValue(g, DataType::kBool, BHWC(1, 1, 1, keys));
+  NewNode(g, ToString(OperationType::kLogicalAnd), {ge, lt}, both);
+}
+
+void Build(Attention& a, std::optional<bool> is_global = std::nullopt) {
   GraphFloat32& g = a.graph;
   Value* q = NewValue(g, DataType::kFloat32, BHWC(1, 2, 4, 256));
   Value* k = NewValue(g, DataType::kFloat32, BHWC(1, 1, 1, 64 * 256));
@@ -75,6 +98,7 @@ void Build(Attention& a) {
   RuntimeBatchedMatMulAttributes qk_attr;
   qk_attr.runtime_check.dst_end_ch_index = 2;
   qk_attr.external_weights = ExternalWeightsAttributes{};
+  qk_attr.is_global = is_global;
   NewNode(g, kRuntimeBatchedMatMulType, {q, k, a.params}, a.logits)->operation.attributes =
       qk_attr;
 
@@ -163,6 +187,60 @@ TEST(BoundedAttentionTest, SkipsATailWhoseProbabilitiesHaveAnotherReader) {
   ASSERT_TRUE(rewritten.ok());
   EXPECT_EQ(*rewritten, 0);
   EXPECT_EQ(a.softmax->operation.type, ToString(OperationType::kSoftmax));
+}
+
+TEST(BoundedAttentionTest, FindsTheSlidingWindow) {
+  GraphFloat32 graph;
+  AddWindowMask(graph, 64, 16);
+  EXPECT_EQ(FindSlidingWindow(graph), 16);
+  AddWindowMask(graph, 64, 16);  // Another graph mask with the same window.
+  EXPECT_EQ(FindSlidingWindow(graph), 16);
+}
+
+TEST(BoundedAttentionTest, NoWindowWhenMasksDisagree) {
+  GraphFloat32 graph;
+  AddWindowMask(graph, 64, 16);
+  AddWindowMask(graph, 64, 32);
+  EXPECT_EQ(FindSlidingWindow(graph), std::nullopt);
+  GraphFloat32 uneven;
+  AddWindowMask(uneven, 64, 16, /*offset_of_last=*/1);
+  EXPECT_EQ(FindSlidingWindow(uneven), std::nullopt);
+}
+
+TEST(BoundedAttentionTest, LocalLayersGetTheWindow) {
+  Attention a;
+  Build(a, /*is_global=*/false);
+  AddWindowMask(a.graph, 64, 16);
+  ASSERT_EQ(*FuseBoundedAttentionSoftmax(&a.graph), 1);
+  const auto& pv = std::any_cast<const RuntimeBatchedMatMulAttributes&>(a.pv->operation.attributes);
+  EXPECT_EQ(pv.runtime_check.window_pos_index, 0);
+  EXPECT_EQ(pv.runtime_check.window_size, 16);
+  EXPECT_TRUE(pv.runtime_check.src_window);
+  EXPECT_FALSE(pv.runtime_check.dst_window);
+  const auto& reduce =
+      std::any_cast<const BoundedSoftmaxReduceAttributes&>(a.softmax->operation.attributes);
+  EXPECT_EQ(reduce.window_pos_index, 0);
+  EXPECT_EQ(reduce.window_size, 16);
+  bool qk_has_window = false;
+  for (Node* node : a.graph.nodes()) {
+    if (node->operation.type != kRuntimeBatchedMatMulType || node == a.pv) continue;
+    const auto& qk = std::any_cast<const RuntimeBatchedMatMulAttributes&>(node->operation.attributes);
+    qk_has_window = qk.runtime_check.dst_window && qk.runtime_check.window_size == 16 &&
+                    !qk.runtime_check.src_window;
+  }
+  EXPECT_TRUE(qk_has_window);
+}
+
+TEST(BoundedAttentionTest, GlobalLayersReadEveryFilledKey) {
+  Attention a;
+  Build(a, /*is_global=*/true);
+  AddWindowMask(a.graph, 64, 16);
+  ASSERT_EQ(*FuseBoundedAttentionSoftmax(&a.graph), 1);
+  const auto& pv = std::any_cast<const RuntimeBatchedMatMulAttributes&>(a.pv->operation.attributes);
+  EXPECT_FALSE(pv.runtime_check.window_pos_index.has_value());
+  const auto& reduce =
+      std::any_cast<const BoundedSoftmaxReduceAttributes&>(a.softmax->operation.attributes);
+  EXPECT_FALSE(reduce.window_pos_index.has_value());
 }
 
 }  // namespace

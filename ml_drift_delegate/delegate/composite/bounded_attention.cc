@@ -15,9 +15,11 @@
 #include "ml_drift_delegate/delegate/composite/bounded_attention.h"
 
 #include <any>
+#include <cstdint>
 #include <cstdlib>
 #include <optional>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -52,6 +54,60 @@ std::optional<float> ScalarParam(const Node& node) {
   if (value == nullptr) return std::nullopt;
   return *value;
 }
+
+// The int32 values of a constant value, or nullptr.
+const std::vector<int32_t>* IntConstant(const GraphFloat32& graph, const Value* value) {
+  const Node* producer = graph.FindProducer(value->id);
+  if (producer == nullptr || producer->operation.type != ToString(OperationType::kConstant)) {
+    return nullptr;
+  }
+  const auto* attr = std::any_cast<::ml_drift::ConstTensorAttributes>(&producer->operation.attributes);
+  if (attr == nullptr) return nullptr;
+  const auto* tensor = std::get_if<::ml_drift::TensorInt32>(&attr->tensor);
+  return tensor == nullptr ? nullptr : &tensor->data;
+}
+
+}  // namespace
+
+std::optional<int> FindSlidingWindow(const GraphFloat32& graph) {
+  // A sliding-window mask keeps key k for position p when p >= k and p < k + W:
+  // LOGICAL_AND(GREATER_EQUAL(p, keys), LESS(p, keys + W)), the keys and keys + W
+  // being int32 constants. Every such mask must agree on W.
+  std::optional<int> window;
+  for (const Node* node : graph.nodes()) {
+    if (node == nullptr || node->operation.type != ToString(OperationType::kLogicalAnd)) continue;
+    const auto inputs = graph.FindInputs(node->id);
+    if (inputs.size() != 2) continue;
+    const Node* ge = graph.FindProducer(inputs[0]->id);
+    const Node* lt = graph.FindProducer(inputs[1]->id);
+    if (ge == nullptr || lt == nullptr) continue;
+    if (ge->operation.type == ToString(OperationType::kLess)) std::swap(ge, lt);
+    if (ge->operation.type != ToString(OperationType::kGreaterEqual) ||
+        lt->operation.type != ToString(OperationType::kLess)) {
+      continue;
+    }
+    const auto ge_inputs = graph.FindInputs(ge->id);
+    const auto lt_inputs = graph.FindInputs(lt->id);
+    if (ge_inputs.size() != 2 || lt_inputs.size() != 2 || ge_inputs[0]->id != lt_inputs[0]->id) {
+      continue;
+    }
+    const std::vector<int32_t>* keys = IntConstant(graph, ge_inputs[1]);
+    const std::vector<int32_t>* shifted = IntConstant(graph, lt_inputs[1]);
+    if (keys == nullptr || shifted == nullptr || keys->empty() || keys->size() != shifted->size()) {
+      continue;
+    }
+    const int w = (*shifted)[0] - (*keys)[0];
+    bool uniform = w > 0;
+    for (size_t i = 0; uniform && i < keys->size(); ++i) {
+      uniform = (*shifted)[i] - (*keys)[i] == w;
+    }
+    if (!uniform || (window && *window != w)) return std::nullopt;
+    window = w;
+  }
+  return window;
+}
+
+namespace {
 
 // The nodes of one attention tail.
 struct Tail {
@@ -160,7 +216,7 @@ std::optional<Tail> MatchTail(const GraphFloat32& graph, Node* softmax) {
   return tail;
 }
 
-absl::Status Rewrite(GraphFloat32* graph, const Tail& tail) {
+absl::Status Rewrite(GraphFloat32* graph, const Tail& tail, std::optional<int> window) {
   // 1. The select becomes the bounded mask: (logits, mask), with the capping
   //    folded in. Masked keys get what the capped select gave them.
   for (Value* input : {tail.mask, tail.logits, tail.fill}) {
@@ -197,12 +253,27 @@ absl::Status Rewrite(GraphFloat32* graph, const Tail& tail) {
 
   // 3. The softmax becomes the bounded reduction: (masked logits, params) ->
   //    per row (1 / sum, max) in a 4-channel tensor.
+  auto* qk_attr = std::any_cast<RuntimeBatchedMatMulAttributes>(&tail.qk->operation.attributes);
+  auto* pv_attr = std::any_cast<RuntimeBatchedMatMulAttributes>(&tail.pv->operation.attributes);
   graph->AddConsumer(tail.softmax->id, tail.params->id);
   tail.softmax->operation.type = kBoundedSoftmaxReduceType;
-  tail.softmax->operation.attributes = BoundedSoftmaxReduceAttributes{
-      .end_ch_index = *std::any_cast<RuntimeBatchedMatMulAttributes>(
-                           &tail.pv->operation.attributes)
-                           ->runtime_check.src_end_ch_index};
+  BoundedSoftmaxReduceAttributes reduce_attr{.end_ch_index =
+                                                 *pv_attr->runtime_check.src_end_ch_index};
+
+  // A sliding-window layer (not global) also starts at its window: the QK product
+  // skips the keys below it (its fused mask masks them), the reduction and the PV
+  // product start there. params[0] is the first new token's position.
+  if (window && qk_attr->is_global.has_value() && !*qk_attr->is_global) {
+    qk_attr->runtime_check.window_pos_index = 0;
+    qk_attr->runtime_check.window_size = *window;
+    qk_attr->runtime_check.dst_window = true;
+    pv_attr->runtime_check.window_pos_index = 0;
+    pv_attr->runtime_check.window_size = *window;
+    pv_attr->runtime_check.src_window = true;
+    reduce_attr.window_pos_index = 0;
+    reduce_attr.window_size = *window;
+  }
+  tail.softmax->operation.attributes = reduce_attr;
   ::ml_drift::BHWC& reduced_shape = tail.probabilities->tensor.shape;
   reduced_shape.c = 4;
 
@@ -213,8 +284,7 @@ absl::Status Rewrite(GraphFloat32* graph, const Tail& tail) {
   ABSL_RETURN_IF_ERROR(graph->RemoveConsumer(tail.pv->id, tail.params->id));
   graph->AddConsumer(tail.pv->id, tail.probabilities->id);
   graph->AddConsumer(tail.pv->id, tail.params->id);
-  std::any_cast<RuntimeBatchedMatMulAttributes>(&tail.pv->operation.attributes)->src_exp_input =
-      true;
+  pv_attr->src_exp_input = true;
   return absl::OkStatus();
 }
 
@@ -228,8 +298,18 @@ bool BoundedAttentionEnabled() {
   return enabled;
 }
 
+bool BoundedWindowEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("AGELLO_BOUNDED_WINDOW");
+    return value == nullptr || value[0] != '0';
+  }();
+  return enabled;
+}
+
 absl::StatusOr<int> FuseBoundedAttentionSoftmax(GraphFloat32* graph) {
   if (graph == nullptr) return 0;
+  const std::optional<int> window =
+      BoundedWindowEnabled() ? FindSlidingWindow(*graph) : std::nullopt;
   std::vector<::ml_drift::NodeId> softmax_ids;
   for (Node* node : graph->nodes()) {
     if (node != nullptr && node->operation.type == ToString(OperationType::kSoftmax)) {
@@ -242,7 +322,7 @@ absl::StatusOr<int> FuseBoundedAttentionSoftmax(GraphFloat32* graph) {
     if (softmax == nullptr) continue;
     std::optional<Tail> tail = MatchTail(*graph, softmax);
     if (!tail) continue;
-    ABSL_RETURN_IF_ERROR(Rewrite(graph, *tail));
+    ABSL_RETURN_IF_ERROR(Rewrite(graph, *tail, window));
     ++rewritten;
   }
   return rewritten;

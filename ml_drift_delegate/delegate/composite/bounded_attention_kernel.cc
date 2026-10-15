@@ -85,6 +85,8 @@ absl::Status CreateBoundedSoftmaxReduceFromNode(const std::vector<::ml_drift::Va
   ABSL_ASSIGN_OR_RETURN(auto params, model_builder->GetTensor(inputs[1]->id));
   ::ml_drift::SoftmaxRuntimeCheckDesc runtime_check;
   runtime_check.end_ch_index = attr->end_ch_index;
+  runtime_check.window_pos_index = attr->window_pos_index;
+  runtime_check.window_size = attr->window_size;
   auto reduced = model_builder->SoftmaxReduce(logits, runtime_check, &params);
   return model_builder->UpdateOutputTensor(reduced, outputs[0]->id);
 }

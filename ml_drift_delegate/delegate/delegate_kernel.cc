@@ -841,7 +841,8 @@ std::string DelegateKernel::ComputeOptionsFingerprint() const {
   absl::StrAppend(&options_fingerprint, backend_->GetBackendName());
   // Agello (T4): the bounded attention rewrite changes the GPU program.
   if (BoundedAttentionEnabled()) {
-    absl::StrAppend(&options_fingerprint, "|agello-bounded-attention-1");
+    absl::StrAppend(&options_fingerprint, "|agello-bounded-attention-2",
+                    BoundedWindowEnabled() ? "" : "-nowindow");
   }
   return options_fingerprint;
 }

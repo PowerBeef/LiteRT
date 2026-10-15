@@ -51,14 +51,28 @@ struct BoundedMaskAttributes {
   std::optional<float> clamp_high;
 };
 
-// A softmax reduction over channels [0, params[end_ch_index]).
+// A softmax reduction over channels [0, params[end_ch_index]), or from a sliding
+// window's start (ml_drift::RuntimeWindowStartSlice) when window_pos_index is set.
 struct BoundedSoftmaxReduceAttributes {
   int end_ch_index = 2;
+  std::optional<int> window_pos_index;
+  int window_size = 0;
 };
 
 // Whether the rewrite runs: yes unless AGELLO_BOUNDED_ATTENTION=0 (for A/B
 // measurements). Part of the program cache key.
 bool BoundedAttentionEnabled();
+
+// Whether local layers get their sliding window: yes unless AGELLO_BOUNDED_WINDOW=0
+// (for A/B measurements). Part of the program cache key.
+bool BoundedWindowEnabled();
+
+// The sliding window of the graph's local attention layers: W when every
+// LOGICAL_AND(GREATER_EQUAL(p, keys), LESS(p, keys + W)) mask with int32
+// constant keys agrees on it, nullopt otherwise. Tails whose runtime_bmm is not
+// global (is_global = false) then read only keys in (p - W, p], from the window's
+// start rounded down to 32 keys.
+std::optional<int> FindSlidingWindow(const ::ml_drift::GraphFloat32& graph);
 
 // Rewrites every matching attention tail; returns how many it rewrote.
 absl::StatusOr<int> FuseBoundedAttentionSoftmax(::ml_drift::GraphFloat32* graph);

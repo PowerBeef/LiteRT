@@ -47,6 +47,10 @@ absl::Status BuildRuntimeBatchedMatMulGpuGraph(
       .src_end_ch_index = runtime_check_attr.src_end_ch_index,
       .dst_end_ch_index = runtime_check_attr.dst_end_ch_index,
   };
+  runtime_check.window_pos_index = runtime_check_attr.window_pos_index;
+  runtime_check.window_size = runtime_check_attr.window_size;
+  runtime_check.dst_window = runtime_check_attr.dst_window;
+  runtime_check.src_window = runtime_check_attr.src_window;
 
   // FC case
   if (attr.external_weights.has_value()) {

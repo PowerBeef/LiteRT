@@ -157,6 +157,8 @@ void RuntimeBatchedMatMulOperationParser::Parse(const TfLiteNode* tflite_node,
   const flexbuffers::Map flexbuffer_map =
       flexbuffers::GetRoot(params->attributes, params->attributes_size).AsMap();
   bool is_src = flexbuffer_map["is_src"].AsBool();
+  // Agello (T4): kept for the bounded attention pass (local layers get a window).
+  const bool is_global = flexbuffer_map["is_global"].AsBool();
   bool is_quantized = !flexbuffer_map["scale"].IsNull();
   bool rhs_cache_update = flexbuffer_map["rhs_cache_update"].AsBool();
 
@@ -170,6 +172,7 @@ void RuntimeBatchedMatMulOperationParser::Parse(const TfLiteNode* tflite_node,
       (rhs_producer && rhs_producer->operation.type == kAddValuesToCacheType)) {
     ::ml_drift::BHWC right_shape = right_value->tensor.shape;
     RuntimeBatchedMatMulAttributes attr;
+    attr.is_global = is_global;
     auto& external_weights = attr.external_weights.emplace();
     external_weights.weights_shape =
         ::ml_drift::OHWI(right_shape.w, right_shape.h, 1, right_shape.c);
@@ -234,6 +237,7 @@ void RuntimeBatchedMatMulOperationParser::Parse(const TfLiteNode* tflite_node,
     graph->SetProducer(fc->id, result_value->id);
   } else {  // Use BatchedMatMul kernel.
     RuntimeBatchedMatMulAttributes attr;
+    attr.is_global = is_global;
     attr.transpose_left = false;
     attr.transpose_right = true;
     if (is_src) {

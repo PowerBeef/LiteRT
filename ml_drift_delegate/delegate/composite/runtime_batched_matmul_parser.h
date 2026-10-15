@@ -36,6 +36,11 @@ constexpr const char kRuntimeBatchedMatMulType[] = "runtime_batched_matmul";
 struct RuntimeCheckParams {
   std::optional<int> src_end_ch_index;
   std::optional<int> dst_end_ch_index;
+  // Agello (T4): a sliding attention window (ConvRuntimeCheckDesc).
+  std::optional<int> window_pos_index;
+  int window_size = 0;
+  bool dst_window = false;
+  bool src_window = false;
 };
 
 struct ExternalWeightsAttributes {
@@ -57,6 +62,8 @@ struct RuntimeBatchedMatMulAttributes {
   // Agello (T4, bounded_attention.h): the FC case reads a softmax reduction as
   // src_exp, the input before params: [src, weights, (bias,) src_exp, params].
   bool src_exp_input = false;
+  // Agello (T4): the composite's is_global (a global attention layer, not a sliding window one).
+  std::optional<bool> is_global;
 };
 
 class RuntimeBatchedMatMulOperationParser : public TFLiteOperationParser {
