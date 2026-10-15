@@ -22,11 +22,13 @@
 #include "ml_drift/metal/metal_device.h"  // from @ml_drift
 #include "ml_drift/metal/metal_spatial_tensor.h"  // from @ml_drift
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -87,27 +89,38 @@ int CopySpan(MetalMemoryInfo* memory_info, bool read, const char* path) {
   return span;
 }
 
-// Agello: whether a GPU tensor can be read straight into host memory by ReadLinearBufferDirect:
-// linear buffer storage the CPU can see, holding the host element type itself.
-bool CanReadLinearBufferDirect(const ::ml_drift::metal::MetalSpatialTensor& tensor,
-                               LiteRtElementType element_type, size_t host_bytes) {
+// Agello: whether a GPU tensor can be copied straight to or from host memory
+// (ReadLinearBufferDirect, WriteLinearBufferDirect): linear buffer storage the CPU can see,
+// holding the host element type itself. Writes to kLinear-layout descriptors also need four
+// elements per slice, the only case whose padding the direct write reproduces.
+bool CanCopyLinearBufferDirect(const ::ml_drift::metal::MetalSpatialTensor& tensor,
+                               LiteRtElementType element_type, size_t host_bytes, bool write) {
   const ::ml_drift::TensorDescriptor desc = tensor.GetDescriptor();
   const ::ml_drift::TensorStorageType storage = desc.GetStorageType();
   if (storage != ::ml_drift::TensorStorageType::kBuffer &&
       storage != ::ml_drift::TensorStorageType::kImageBuffer) {
     return false;
   }
-  const ::ml_drift::DataType data_type = desc.GetDataType();
-  const bool same_type =
-      (data_type == ::ml_drift::DataType::kFloat16 &&
-       element_type == kLiteRtElementTypeFloat16) ||
-      (data_type == ::ml_drift::DataType::kFloat32 &&
-       element_type == kLiteRtElementTypeFloat32) ||
-      (data_type == ::ml_drift::DataType::kInt32 && element_type == kLiteRtElementTypeInt32);
+  if (write && desc.GetLayout() == ::ml_drift::Layout::kLinear && desc.GetElementSize() != 4) {
+    return false;
+  }
+  ::ml_drift::DataType host_type;
+  switch (element_type) {
+    case kLiteRtElementTypeFloat16: host_type = ::ml_drift::DataType::kFloat16; break;
+    case kLiteRtElementTypeFloat32: host_type = ::ml_drift::DataType::kFloat32; break;
+    case kLiteRtElementTypeInt8: host_type = ::ml_drift::DataType::kInt8; break;
+    case kLiteRtElementTypeUInt8: host_type = ::ml_drift::DataType::kUint8; break;
+    case kLiteRtElementTypeInt16: host_type = ::ml_drift::DataType::kInt16; break;
+    case kLiteRtElementTypeUInt16: host_type = ::ml_drift::DataType::kUint16; break;
+    case kLiteRtElementTypeInt32: host_type = ::ml_drift::DataType::kInt32; break;
+    case kLiteRtElementTypeUInt32: host_type = ::ml_drift::DataType::kUint32; break;
+    default: return false;
+  }
   id<MTLBuffer> buffer = tensor.GetBufferHandle();
-  return same_type && buffer != nil && buffer.storageMode == MTLStorageModeShared &&
+  return desc.GetDataType() == host_type && buffer != nil &&
+         buffer.storageMode == MTLStorageModeShared &&
          static_cast<size_t>(desc.GetBHWDCShape().DimensionsProduct()) *
-                 ::ml_drift::SizeOf(data_type) ==
+                 ::ml_drift::SizeOf(host_type) ==
              host_bytes;
 }
 
@@ -122,9 +135,95 @@ void ReadLinearBufferDirect(const ::ml_drift::metal::MetalSpatialTensor& tensor,
   const size_t element = ::ml_drift::SizeOf(desc.GetDataType());
   const int slices = ::ml_drift::DivideRoundUp(shape.c, 4);
   const int full_slices = shape.c / 4;
+  const size_t group = 4 * element;
   const size_t tail = (shape.c % 4) * element;
+  const size_t row_bytes = shape.c * element;
   const uint8_t* src = static_cast<const uint8_t*>(tensor.GetBufferPointer());
   uint8_t* dst = static_cast<uint8_t*>(host_memory);
+  // Each row's first element in the GPU layout, in host (BHWDC) row order, and the distance
+  // between its slices (the same for every row in both linear layouts).
+  const size_t row_count = static_cast<size_t>(shape.b) * shape.h * shape.w * shape.d;
+  std::vector<int64_t> bases;
+  std::vector<int64_t> strides;
+  bases.reserve(row_count);
+  strides.reserve(row_count);
+  for (int b = 0; b < shape.b; ++b) {
+    for (int y = 0; y < shape.h; ++y) {
+      for (int x = 0; x < shape.w; ++x) {
+        for (int d = 0; d < shape.d; ++d) {
+          const int64_t base = desc.GetLinearIndex(shape, b, x, y, d, 0, 0);
+          const int64_t row_stride =
+              slices > 1 ? desc.GetLinearIndex(shape, b, x, y, d, 1, 0) - base : 4;
+          bases.push_back(base);
+          strides.push_back(row_stride);
+        }
+      }
+    }
+  }
+  const int64_t rows = static_cast<int64_t>(bases.size());
+  if (std::all_of(strides.begin(), strides.end(), [](int64_t v) { return v == 4; })) {
+    // CC4, or a single slice: each row is contiguous.
+    for (int64_t r = 0; r < rows; ++r) {
+      std::memcpy(dst + r * row_bytes, src + bases[r] * element, row_bytes);
+    }
+    return;
+  }
+  // A row's slices lie a stride apart: a transpose of 4-element groups, done in 32 x 32 tiles so
+  // reads and writes stay within a few cache lines (3.4x faster than row by row for a 4 MB INT8
+  // KV cache), with the group size a constant so each copy is one load and one store.
+  constexpr int64_t kTile = 32;
+  const auto copy_tiles = [&](auto group_size) {
+    constexpr size_t kGroup = decltype(group_size)::value;
+    for (int64_t r0 = 0; r0 < rows; r0 += kTile) {
+      const int64_t r1 = std::min(rows, r0 + kTile);
+      for (int64_t s0 = 0; s0 < full_slices; s0 += kTile) {
+        const int64_t s1 = std::min<int64_t>(full_slices, s0 + kTile);
+        for (int64_t r = r0; r < r1; ++r) {
+          const uint8_t* from = src + bases[r] * element;
+          const size_t step = strides[r] * element;
+          uint8_t* row = dst + r * row_bytes;
+          for (int64_t s = s0; s < s1; ++s) {
+            std::memcpy(row + s * kGroup, from + s * step, kGroup);
+          }
+        }
+      }
+    }
+  };
+  switch (group) {
+    case 4: copy_tiles(std::integral_constant<size_t, 4>()); break;
+    case 8: copy_tiles(std::integral_constant<size_t, 8>()); break;
+    default: copy_tiles(std::integral_constant<size_t, 16>()); break;  // 4-byte elements
+  }
+  if (tail) {  // The last, partial slice of each row.
+    for (int64_t r = 0; r < rows; ++r) {
+      std::memcpy(dst + r * row_bytes + full_slices * group,
+                  src + (bases[r] + full_slices * strides[r]) * element, tail);
+    }
+  }
+}
+
+// Agello: writes host memory in BHWDC order into a linear buffer tensor, the inverse of
+// ReadLinearBufferDirect, with the zero padding ML Drift's upload (DataFromBHWDC, DataFromLinear)
+// puts in a row's last slice. ML Drift's upload also makes a new command queue each time, which
+// cost about 0.2 ms even for a few bytes.
+void WriteLinearBufferDirect(const ::ml_drift::metal::MetalSpatialTensor& tensor,
+                             const void* host_memory) {
+  const ::ml_drift::TensorDescriptor desc = tensor.GetDescriptor();
+  const size_t element = ::ml_drift::SizeOf(desc.GetDataType());
+  const uint8_t* src = static_cast<const uint8_t*>(host_memory);
+  uint8_t* dst = static_cast<uint8_t*>(tensor.GetBufferPointer());
+  if (desc.GetLayout() == ::ml_drift::Layout::kLinear) {
+    const size_t used = static_cast<size_t>(desc.GetBHWCShape().c) * element;
+    const size_t total = ::ml_drift::DivideRoundUp(desc.GetBHWCShape().c, 4) * 4 * element;
+    std::memcpy(dst, src, used);
+    std::memset(dst + used, 0, total - used);
+    return;
+  }
+  const ::ml_drift::BHWDC shape = desc.GetBHWDCShape();
+  const int slices = ::ml_drift::DivideRoundUp(shape.c, 4);
+  const int full_slices = shape.c / 4;
+  const size_t group = 4 * element;
+  const size_t tail = (shape.c % 4) * element;
   for (int b = 0; b < shape.b; ++b) {
     for (int y = 0; y < shape.h; ++y) {
       for (int x = 0; x < shape.w; ++x) {
@@ -132,32 +231,30 @@ void ReadLinearBufferDirect(const ::ml_drift::metal::MetalSpatialTensor& tensor,
           const int64_t base = desc.GetLinearIndex(shape, b, x, y, d, 0, 0);
           const int64_t stride =
               slices > 1 ? desc.GetLinearIndex(shape, b, x, y, d, 1, 0) - base : 4;
-          const uint8_t* from = src + base * element;
-          uint8_t* row = dst + shape.LinearIndex({b, y, x, d, 0}) * element;
+          const uint8_t* row = src + shape.LinearIndex({b, y, x, d, 0}) * element;
+          uint8_t* to = dst + base * element;
           if (stride == 4) {
-            std::memcpy(row, from, shape.c * element);
+            std::memcpy(to, row, shape.c * element);
+            std::memset(to + shape.c * element, 0, slices * group - shape.c * element);
             continue;
           }
           const size_t step = stride * element;
-          if (element == 2) {
-            for (int s = 0; s < full_slices; ++s) std::memcpy(row + s * 8, from + s * step, 8);
-          } else {
-            for (int s = 0; s < full_slices; ++s) {
-              std::memcpy(row + s * 4 * element, from + s * step, 4 * element);
-            }
+          for (int s = 0; s < full_slices; ++s) std::memcpy(to + s * step, row + s * group, group);
+          if (tail) {
+            std::memcpy(to + full_slices * step, row + full_slices * group, tail);
+            std::memset(to + full_slices * step + tail, 0, group - tail);
           }
-          if (tail) std::memcpy(row + full_slices * 4 * element, from + full_slices * step, tail);
         }
       }
     }
   }
 }
 
-// Agello: AGELLO_VERIFY_DIRECT_READ=1 also runs ML Drift's download after each direct read and
-// reports an error anomaly if the bytes differ.
-bool VerifyDirectReads() {
+// Agello: AGELLO_VERIFY_DIRECT_COPIES=1 also runs ML Drift's own conversion after each direct
+// copy and reports an error anomaly if the bytes differ.
+bool VerifyDirectCopies() {
   static const bool verify = [] {
-    const char* value = std::getenv("AGELLO_VERIFY_DIRECT_READ");
+    const char* value = std::getenv("AGELLO_VERIFY_DIRECT_COPIES");
     return value != nullptr && value[0] == '1';
   }();
   return verify;
@@ -418,13 +515,31 @@ LiteRtStatus LiteRtUnlockMetalMemory(HwMemoryInfoPtr hw_memory_info) {
                              static_cast<int64_t>(memory_info->packed_bytes));
   ::agello::telemetry::ScopedSpan copy_span(::agello::telemetry::kHostUnlockWrite,
                                             static_cast<int64_t>(memory_info->packed_bytes));
-  ::agello::telemetry::ScopedSpan size_span(CopySpan(
-      memory_info, /*read=*/false,
-      memory_info->buffer_type == kLiteRtTensorBufferTypeMetalBufferPacked ? "" : " (converted)"));
+  const bool packed = memory_info->buffer_type == kLiteRtTensorBufferTypeMetalBufferPacked;
+  const bool direct =
+      !packed && CanCopyLinearBufferDirect(gpu_tensor, memory_info->tensor_type.element_type,
+                                           memory_info->packed_bytes, /*write=*/true);
+  ::agello::telemetry::ScopedSpan size_span(
+      CopySpan(memory_info, /*read=*/false, packed ? "" : direct ? " (direct)" : " (converted)"));
   absl::Status absl_status = absl::OkStatus();
-  if (memory_info->buffer_type == kLiteRtTensorBufferTypeMetalBufferPacked) {
+  if (packed) {
     WriteDataToBuffer(gpu_tensor.GetBufferHandle(), 0, command_queue, memory_info->host_memory,
                       memory_info->packed_bytes, false);
+  } else if (direct) {
+    WriteLinearBufferDirect(gpu_tensor, memory_info->host_memory);
+    if (VerifyDirectCopies()) {
+      ::ml_drift::TensorDescriptor reference = gpu_tensor.GetDescriptor();
+      ::litert::ml_drift::ConvertDataToDescriptor(memory_info->host_memory, reference,
+                                                  memory_info->tensor_type.element_type);
+      const size_t size = std::min<size_t>(reference.GetData().size(),
+                                           gpu_tensor.GetMemorySizeInBytes());
+      if (reference.GetData().size() != gpu_tensor.GetMemorySizeInBytes() ||
+          std::memcmp(reference.GetData().data(), gpu_tensor.GetBufferPointer(), size) != 0) {
+        ::agello::telemetry::ReportAnomaly(
+            ::agello::telemetry::kNumerics, ::agello::telemetry::kError,
+            static_cast<int64_t>(size), 1, "direct buffer write differs from ML Drift's upload");
+      }
+    }
   } else {
     // TODO: b/413431454 - Use Tensor Converter for better performance.
     ::ml_drift::TensorDescriptor desc_with_data = gpu_tensor.GetDescriptor();
@@ -483,8 +598,8 @@ LiteRtStatus LiteRtLockMetalMemory(HwMemoryInfoPtr hw_memory_info, LiteRtTensorB
                                             static_cast<int64_t>(memory_info->packed_bytes));
   const bool packed = memory_info->buffer_type == kLiteRtTensorBufferTypeMetalBufferPacked;
   const bool direct =
-      !packed && CanReadLinearBufferDirect(gpu_tensor, memory_info->tensor_type.element_type,
-                                           memory_info->packed_bytes);
+      !packed && CanCopyLinearBufferDirect(gpu_tensor, memory_info->tensor_type.element_type,
+                                           memory_info->packed_bytes, /*write=*/false);
   ::agello::telemetry::ScopedSpan size_span(
       CopySpan(memory_info, /*read=*/true, packed ? "" : direct ? " (direct)" : " (converted)"));
   absl::Status absl_status = absl::OkStatus();
@@ -494,7 +609,7 @@ LiteRtStatus LiteRtLockMetalMemory(HwMemoryInfoPtr hw_memory_info, LiteRtTensorB
                        memory_info->packed_bytes);
   } else if (direct) {
     ReadLinearBufferDirect(gpu_tensor, memory_info->host_memory);
-    if (VerifyDirectReads()) {
+    if (VerifyDirectCopies()) {
       std::vector<uint8_t> reference(memory_info->packed_bytes);
       ::ml_drift::TensorDescriptor descriptor_with_data = gpu_tensor.GetDescriptor();
       if (gpu_tensor.ToDescriptor(&descriptor_with_data, metal_device).ok()) {
